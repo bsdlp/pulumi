@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/blang/semver"
+
 	"github.com/pulumi/pulumi/sdk/v2/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/util/contract"
@@ -458,6 +460,15 @@ func unmarshalPropertyValue(v resource.PropertyValue) (interface{}, bool, error)
 	case v.IsResourceReference():
 		ref := v.ResourceReferenceValue()
 
+		version := nullVersion
+		if len(ref.PackageVersion) > 0 {
+			var err error
+			version, err = semver.ParseTolerant(ref.PackageVersion)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to parse provider version: %s", ref.PackageVersion)
+			}
+		}
+
 		resName := ref.URN.Name().String()
 		resType := ref.URN.Type()
 
@@ -467,7 +478,7 @@ func unmarshalPropertyValue(v resource.PropertyValue) (interface{}, bool, error)
 		isProvider := tokens.Token(resType).HasModuleMember() && resType.Module() == "pulumi:providers"
 		if isProvider {
 			pkgName := resType.Name().String()
-			resourcePackageV, ok := resourcePackages.Load(pkgName)
+			resourcePackageV, ok := resourcePackages.Load(pkgName, version)
 			if !ok {
 				err := fmt.Errorf("unable to deserialize provider %v, no resource package is registered for %v",
 					ref.URN, pkgName)
@@ -478,7 +489,7 @@ func unmarshalPropertyValue(v resource.PropertyValue) (interface{}, bool, error)
 		} else {
 			pkgName := resType.Package().String()
 			modName := resType.Module().String()
-			resourceModuleV, ok := resourceModules.Load(moduleKey(pkgName, modName))
+			resourceModuleV, ok := resourceModules.Load(moduleKey(pkgName, modName), version)
 			if !ok {
 				err := fmt.Errorf("unable to deserialize resource %v, no module is registered for %v", ref.URN, modName)
 				return nil, false, err
@@ -683,25 +694,113 @@ func unmarshalOutput(v resource.PropertyValue, dest reflect.Value) (bool, error)
 
 type ResourcePackage interface {
 	ConstructProvider(name, typ string, urn string) (ProviderResource, error)
-	Version() string
+	Version() semver.Version
 }
 
-var resourcePackages sync.Map // map[string]ResourcePackage
+type resourcePackageMap struct {
+	sync.RWMutex
+	packages map[string][]ResourcePackage
+}
+
+// nullVersion represents the wildcard version (match any version).
+var nullVersion semver.Version
+
+func (r resourcePackageMap) Load(pkg string, version semver.Version) (ResourcePackage, bool) {
+	r.RLock()
+	defer r.RUnlock()
+
+	packages, exists := r.packages[pkg]
+	if !exists {
+		return nil, false
+	}
+
+	var bestPkg ResourcePackage
+	for _, p := range packages {
+		if bestPkg.Version().EQ(nullVersion) {
+			bestPkg = p
+		}
+		if version.EQ(nullVersion) && p.Version().GTE(bestPkg.Version()) {
+			bestPkg = p
+			continue
+		}
+		if p.Version().EQ(version) {
+			return p, true
+		}
+	}
+	return bestPkg, true
+}
+
+func (r resourcePackageMap) Store(pkg string, resourcePackage ResourcePackage) error {
+	r.Lock()
+	defer r.Unlock()
+
+	if _, exists := r.Load(pkg, resourcePackage.Version()); exists {
+		return fmt.Errorf("a resource package for %v is already registered: %v", pkg, resourcePackage)
+	}
+
+	r.packages[pkg] = append(r.packages[pkg], resourcePackage)
+
+	return nil
+}
+
+var resourcePackages resourcePackageMap
 
 // RegisterResourcePackage register a resource package with the Pulumi runtime.
 func RegisterResourcePackage(pkg string, resourcePackage ResourcePackage) {
-	existing, hasExisting := resourcePackages.LoadOrStore(pkg, resourcePackage)
-	if hasExisting {
-		panic(fmt.Errorf("a resource package for %v is already registered: %v", pkg, existing))
+	if err := resourcePackages.Store(pkg, resourcePackage); err != nil {
+		panic(err)
 	}
 }
 
 type ResourceModule interface {
 	Construct(name, typ string, urn string) (Resource, error)
-	Version() string
+	Version() semver.Version
 }
 
-var resourceModules sync.Map // map[string]ResourceModule
+type resourceModuleMap struct {
+	sync.RWMutex
+	modules map[string][]ResourceModule
+}
+
+func (r resourceModuleMap) Load(key string, version semver.Version) (ResourceModule, bool) {
+	r.RLock()
+	defer r.RUnlock()
+
+	packages, exists := r.modules[key]
+	if !exists {
+		return nil, false
+	}
+
+	var bestModule ResourceModule
+	for _, p := range packages {
+		if bestModule.Version().EQ(nullVersion) {
+			bestModule = p
+		}
+		if version.EQ(nullVersion) && p.Version().GTE(bestModule.Version()) {
+			bestModule = p
+			continue
+		}
+		if p.Version().EQ(version) {
+			return p, true
+		}
+	}
+	return bestModule, true
+}
+
+func (r resourceModuleMap) Store(pkg string, resouceModule ResourceModule) error {
+	r.Lock()
+	defer r.Unlock()
+
+	if _, exists := r.Load(pkg, resouceModule.Version()); exists {
+		return fmt.Errorf("a resource module for %v is already registered: %v", pkg, resouceModule)
+	}
+
+	r.modules[pkg] = append(r.modules[pkg], resouceModule)
+
+	return nil
+}
+
+var resourceModules resourceModuleMap
 
 func moduleKey(pkg, mod string) string {
 	return fmt.Sprintf("%s:%s", pkg, mod)
@@ -710,8 +809,7 @@ func moduleKey(pkg, mod string) string {
 // RegisterResourceModule register a resource module with the Pulumi runtime.
 func RegisterResourceModule(pkg, mod string, module ResourceModule) {
 	key := moduleKey(pkg, mod)
-	existing, hasExisting := resourceModules.LoadOrStore(key, module)
-	if hasExisting {
-		panic(fmt.Errorf("a resource module for %v is already registered: %v", key, existing))
+	if err := resourceModules.Store(key, module); err != nil {
+		panic(err)
 	}
 }
